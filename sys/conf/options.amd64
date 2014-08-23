@@ -65,3 +65,6 @@ KDTRACE_FRAME		opt_kdtrace.h
 BPF_JITTER		opt_bpf.h
 
 XENHVM			opt_global.h
+
+# Option to build kernel in NestedKernel Mode
+NESTEDKERNEL            opt_global.h
