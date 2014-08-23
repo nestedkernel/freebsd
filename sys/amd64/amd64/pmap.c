@@ -108,6 +108,7 @@ __FBSDID("$FreeBSD$");
 #include "opt_pmap.h"
 #include "opt_vm.h"
 
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -150,6 +151,10 @@ __FBSDID("$FreeBSD$");
 
 #ifndef PMAP_SHPGPERPROC
 #define PMAP_SHPGPERPROC 200
+#endif
+
+#ifdef NESTEDKERNEL
+#include "nk/nk_cpufunc.h"
 #endif
 
 #if !defined(DIAGNOSTIC)
@@ -670,7 +675,11 @@ pmap_init_pat(void)
 
 	/* Disable PGE. */
 	cr4 = rcr4();
+#ifdef NESTEDKERNEL
+	nk_load_cr4(cr4 & ~CR4_PGE);
+#else
 	load_cr4(cr4 & ~CR4_PGE);
+#endif
 
 	/* Disable caches (CD = 1, NW = 0). */
 	cr0 = rcr0();
