@@ -155,6 +155,7 @@ __FBSDID("$FreeBSD$");
 
 #ifdef NESTEDKERNEL
 #include "nk/nk_cpufunc.h"
+#include "nk/vmmu.h"
 #endif
 
 #if !defined(DIAGNOSTIC)
@@ -571,6 +572,17 @@ pmap_bootstrap(vm_paddr_t *firstaddr)
 	 * Create an initial set of page tables to run the kernel in.
 	 */
 	create_pagetables(firstaddr);
+
+#ifdef NESTEDKERNEL
+	/*
+	 * Set the static address locations in the struct here to aid in
+	 * kernel MMU initialization.
+	 * Note that we pass in the page mapping for the pml4 page.
+	 * This function will also initialize the cr3 and cr4.
+	 */
+	nk_vmmu_init(&((pdp_entry_t *)KPML4phys)[PML4PML4I],
+		     NPDEPG, firstaddr, (uintptr_t)btext, (uintptr_t)etext);
+#endif
 
 	virtual_avail = (vm_offset_t) KERNBASE + *firstaddr;
 	virtual_avail = pmap_kmem_choose(virtual_avail);
