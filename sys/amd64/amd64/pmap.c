@@ -154,7 +154,6 @@ __FBSDID("$FreeBSD$");
 #endif
 
 #ifdef NESTEDKERNEL
-#include "nk/nk_cpufunc.h"
 #include "nk/vmmu.h"
 #endif
 
@@ -687,11 +686,7 @@ pmap_init_pat(void)
 
 	/* Disable PGE. */
 	cr4 = rcr4();
-#ifdef NESTEDKERNEL
-	nk_load_cr4(cr4 & ~CR4_PGE);
-#else
 	load_cr4(cr4 & ~CR4_PGE);
-#endif
 
 	/* Disable caches (CD = 1, NW = 0). */
 	cr0 = rcr0();
