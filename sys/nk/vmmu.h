@@ -50,5 +50,11 @@
 
 #ifndef __VMMU_H_
 #define __VMMU_H_
-#endif /* !__VMMU_H_ */
 
+#include "pmmu.h"
+
+void	nk_load_pgtbl_base_ptr(register_t val);
+void	nk_vmmu_init(pml4e_t *kpml4Mapping, unsigned long nkpml4e,
+		     uintptr_t *firstpaddr, uintptr_t btext, uintptr_t etext);
+
+#endif /* !__VMMU_H_ */
