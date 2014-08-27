@@ -3507,3 +3507,6 @@ dev/xen/xenpci/evtchn.c         optional xenpci
 #   requires that the outer kernel code does not execute privilege operations:
 #   writes to control registers 0, 3, and 4; and writes to MSRs.
 nk/nk_cpufunc.c			optional nestedkernel
+nk/nk_cpufunc.c			optional nestedkernel
+nk/vmmu.c			optional nestedkernel
+nk/pmmu.c			optional nestedkernel
