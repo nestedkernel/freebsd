@@ -381,49 +381,48 @@ get_ptePaddr(pde_t *pde, uintptr_t vaddr)
 static inline page_entry_t *
 get_pgeVaddr(uintptr_t vaddr)
 {
-    /* Pointer to the page table entry for the virtual address */
-    page_entry_t *pge = 0;
+	uintptr_t	 cr3;
+	pml4e_t		*pml4e;
+	pdpte_t		*pdpte;
+	pde_t		*pde;
 
-    /* Get the base of the pml4 to traverse */
-    uintptr_t cr3 = get_pagetable();
-    if ((cr3 & 0xfffffffffffff000u) == 0)
-        return 0;
+	/* Get the base of the pml4 to traverse */
+	cr3 = get_pagetable();
+	if ((cr3 & 0xfffffffffffff000u) == 0)
+		return 0;
 
-    /* Get the VA of the pml4e for this vaddr */
-    pml4e_t *pml4e = get_pml4eVaddr (cr3, vaddr);
+	/* Get the VA of the pml4e for this vaddr */
+	pml4e = get_pml4eVaddr(cr3, vaddr);
+	if (!(*pml4e & PG_V))
+		return 0;
 
-    if (*pml4e & PG_V) {
-        /* Get the VA of the pdpte for this vaddr */
-        pdpte_t *pdpte = get_pdpteVaddr (pml4e, vaddr);
-        if (*pdpte & PG_V) {
-            /*
-             * The PDPE can be configurd in large page mode. If it is then we have the
-             * entry corresponding to the given vaddr If not then we go deeper in the
-             * page walk.
-             */
-            if (*pdpte & PG_PS) {
-                pge = pdpte;
-            } else {
-                /* Get the pde associated with this vaddr */
-                pde_t *pde = get_pdeVaddr (pdpte, vaddr);
-                if (*pde & PG_V) {
-                    /*
-                     * As is the case with the pdpte, if the pde is configured for large
-                     * page size then we have the corresponding entry. Otherwise we need
-                     * to traverse one more level, which is the last.
-                     */
-                    if (*pde & PG_PS) {
-                        pge = pde;
-                    } else {
-                        pge = get_pteVaddr (pde, vaddr);
-                    }
-                }
-            }
-        }
-    }
+	/* Get the VA of the pdpte for this vaddr */
+	pdpte = get_pdpteVaddr(pml4e, vaddr);
+	if (!(*pdpte & PG_V))
+		return 0;
 
-    /* Return the entry corresponding to this vaddr */
-    return pge;
+	/*
+	 * The PDPE can be configurd in large page mode. If it is then we have
+	 * the entry corresponding to the given vaddr If not then we go deeper
+	 * in the page walk.
+	 */
+	if (*pdpte & PG_PS)
+		return pdpte;
+
+	/* Get the pde associated with this vaddr */
+	pde = get_pdeVaddr(pdpte, vaddr);
+	if (!(*pde & PG_V))
+		return 0;
+
+	/*
+	 * As is the case with the pdpte, if the pde is configured for large
+	 * page size then we have the corresponding entry. Otherwise we need
+	 * to traverse one more level, which is the last.
+	 */
+	if (*pde & PG_PS)
+		return pde;
+
+	return get_pteVaddr(pde, vaddr);
 }
 
 /*
