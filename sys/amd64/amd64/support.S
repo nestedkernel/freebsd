@@ -716,8 +716,12 @@ ENTRY(wrmsr_safe)
 	movl	%esi,%eax
 	sarq	$32,%rsi
 	movl	%esi,%edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr			/* Write MSR pointed by %ecx. Accepts
 				   hi byte in edx, lo in %eax. */
+#endif
 	xorq	%rax,%rax
 	movq	%rax,PCB_ONFAULT(%r8)
 	ret

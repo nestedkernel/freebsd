@@ -131,19 +131,19 @@ void nk_load_msr(register_t msr, register_t val)
  *  given in edx:eax and the MSR should be given in ecx. If the MSR is
  *  EFER, we need to make sure that the NXE bit is enabled.
  */
-#if 0
 void nk_wrmsr(void)
 {
 	register_t val;
 	register_t msr;
+
 	__asm__ __volatile__ (
 	    "wrmsr\n"
 	    : "=c" (msr), "=a" (val)
 	    :
 	    : "rax", "rcx", "rdx"
 	    );
+
 	if ((msr == MSR_REG_EFER) && !(val & EFER_NXE))
 		panic("Nested Kernel: attempt to clear the EFER.NXE bit: %x.",
 		      (void *) val);
 }
-#endif

@@ -351,11 +351,15 @@ write_rflags(u_long rf)
 static __inline void
 wrmsr(u_int msr, uint64_t newval)
 {
+#ifdef NESTEDKERNEL
+	nk_load_msr(msr, newval);
+#else
 	uint32_t low, high;
 
 	low = newval;
 	high = newval >> 32;
 	__asm __volatile("wrmsr" : : "a" (low), "d" (high), "c" (msr));
+#endif
 }
 
 static __inline void
@@ -505,8 +509,13 @@ static __inline void
 load_fs(u_short sel)
 {
 	/* Preserve the fsbase value across the selector load */
+#ifdef NESTEDKERNEL
+	__asm __volatile("rdmsr; movw %0,%%fs; callq nk_wrmsr"
+	    : : "rm" (sel), "c" (MSR_FSBASE) : "eax", "edx");
+#else
 	__asm __volatile("rdmsr; movw %0,%%fs; wrmsr"
 	    : : "rm" (sel), "c" (MSR_FSBASE) : "eax", "edx");
+#endif
 }
 
 #ifndef	MSR_GSBASE
@@ -520,8 +529,13 @@ load_gs(u_short sel)
 	 * Note that we have to disable interrupts because the gsbase
 	 * being trashed happens to be the kernel gsbase at the time.
 	 */
+#ifdef NESTEDKERNEL
+	__asm __volatile("pushfq; cli; rdmsr; movw %0,%%gs; callq nk_wrmsr; popfq"
+	    : : "rm" (sel), "c" (MSR_GSBASE) : "eax", "edx");
+#else
 	__asm __volatile("pushfq; cli; rdmsr; movw %0,%%gs; wrmsr; popfq"
 	    : : "rm" (sel), "c" (MSR_GSBASE) : "eax", "edx");
+#endif
 }
 #else
 /* Usable by userland */

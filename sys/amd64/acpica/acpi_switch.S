@@ -38,7 +38,13 @@
 
 ENTRY(acpi_restorecpu)
 	/* Switch to KPML4phys. */
+#ifdef NESTEDKERNEL
+	pushq	%rdi
+	callq	nk_load_pgtbl_base_ptr
+	popq	%rdi
+#else
 	movq	%rdi, %cr3
+#endif
 
 	/* Restore GDT. */
 	lgdt	WAKEUP_CTX(gdt)
@@ -61,49 +67,95 @@ ENTRY(acpi_restorecpu)
 	movl	$MSR_FSBASE, %ecx
 	movl	PCB_FSBASE(%rdi), %eax
 	movl	4 + PCB_FSBASE(%rdi), %edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 	movl	$MSR_GSBASE, %ecx
 	movl	PCB_GSBASE(%rdi), %eax
 	movl	4 + PCB_GSBASE(%rdi), %edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 	movl	$MSR_KGSBASE, %ecx
 	movl	PCB_KGSBASE(%rdi), %eax
 	movl	4 + PCB_KGSBASE(%rdi), %edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 
 	/* Restore EFER. */
 	movl	$MSR_EFER, %ecx
 	movl	WAKEUP_CTX(efer), %eax
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 
 	/* Restore fast syscall stuff. */
 	movl	$MSR_STAR, %ecx
 	movl	WAKEUP_CTX(star), %eax
 	movl	4 + WAKEUP_CTX(star), %edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 	movl	$MSR_LSTAR, %ecx
 	movl	WAKEUP_CTX(lstar), %eax
 	movl	4 + WAKEUP_CTX(lstar), %edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 	movl	$MSR_CSTAR, %ecx
 	movl	WAKEUP_CTX(cstar), %eax
 	movl	4 + WAKEUP_CTX(cstar), %edx
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 	movl	$MSR_SF_MASK, %ecx
 	movl	WAKEUP_CTX(sfmask), %eax
+#ifdef NESTEDKERNEL
+	callq	nk_wrmsr
+#else
 	wrmsr
+#endif
 
 	/* Restore CR0 except for FPU mode. */
 	movq	PCB_CR0(%rdi), %rax
 	movq	%rax, %rcx
 	andq	$~(CR0_EM | CR0_TS), %rax
+#ifdef NESTEDKERNEL
+	pushq	%rdi
+	movq	%rax, %rdi
+	callq	nk_load_cr0
+	popq	%rdi
+#else
 	movq	%rax, %cr0
+#endif
 
 	/* Restore CR2 and CR4. */
 	movq	PCB_CR2(%rdi), %rax
 	movq	%rax, %cr2
 	movq	PCB_CR4(%rdi), %rax
+#ifdef NESTEDKERNEL
+	pushq	%rdi
+	movq	%rax, %rdi
+	callq	nk_load_cr4
+	popq	%rdi
+#else
 	movq	%rax, %cr4
+#endif
 
 	/* Restore descriptor tables. */
 	lidt	PCB_IDT(%rdi)
@@ -149,7 +201,14 @@ ENTRY(acpi_restorecpu)
 	fxrstor	PCB_USERFPU(%rdi)
 
 	/* Reload CR0. */
+#ifdef NESTEDKERNEL
+	pushq	%rdi
+	movq	%rcx, %rdi
+	callq	nk_load_cr0
+	popq	%rdi
+#else
 	movq	%rcx, %cr0
+#endif
 
 	/* Restore return address. */
 	movq	PCB_RIP(%rdi), %rax
