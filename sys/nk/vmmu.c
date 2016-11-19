@@ -105,3 +105,164 @@ SECURE_WRAPPER(void, nk_vmmu_init,
 {
 	pmmu_init(kpml4Mapping, nkpml4e, firstpaddr, btext, etext);
 }
+
+
+/*
+ * Intrinsic: nk_vmmu_declare_l1_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 1 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 1 page frame.
+ */
+SECURE_WRAPPER(void, nk_vmmu_declare_l1_page,
+	       uintptr_t frameAddr)
+{
+	nk_pmmu_declare_l1_page(frameAddr);
+}
+
+/*
+ * Intrinsic: nk_vmmu_declare_l2_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 2 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 2 page frame.
+ */
+SECURE_WRAPPER(void, nk_vmmu_declare_l2_page,
+	       uintptr_t frameAddr)
+{
+	nk_pmmu_declare_l2_page(frameAddr);
+}
+
+/*
+ * Intrinsic: nk_vmmu_declare_l3_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 3 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 3 page frame.
+ */
+SECURE_WRAPPER(void, nk_vmmu_declare_l3_page,
+	       uintptr_t frameAddr)
+{
+	nk_pmmu_declare_l2_page(frameAddr);
+}
+
+/*
+ * Intrinsic: nk_vmmu_declare_l4_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 4 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 4 page frame.
+ */
+SECURE_WRAPPER(void,
+nk_vmmu_declare_l4_page, uintptr_t frameAddr)
+{
+	nk_pmmu_declare_l4_page(frameAddr);
+}
+
+/*
+ * Function: nk_vmmu_remove_page()
+ *
+ * Description:
+ *  This function informs the NK VM that the system software no longer wants
+ *  to use the specified page as a page table page.
+ *
+ * Inputs:
+ *  paddr - The physical address of the page table page.
+ */
+SECURE_WRAPPER(void, nk_vmmu_remove_page,
+	       uintptr_t paddr)
+{
+	nk_pmmu_remove_page(paddr);
+}
+
+/*
+ * Function: nk_vmmu_update_l1_mapping()
+ *
+ * Description:
+ *  This function updates a Level-1 Mapping.  In other words, it adds a
+ *  a direct translation from a virtual page to a physical page.
+ *
+ *  This function makes different checks to ensure the mapping
+ *  does not bypass the type safety proved by the compiler.
+ *
+ * Inputs:
+ *  pteptr - The location within the L1 page in which the new translation
+ *           should be place.
+ *  val    - The new translation to insert into the page table.
+ */
+SECURE_WRAPPER(void, nk_vmmu_update_l1_mapping,
+	       pte_t *pteptr, page_entry_t val)
+{
+	nk_pmmu_update_l1_mapping(pteptr, val);
+}
+
+/*
+ * Updates a level2 mapping (a mapping to a l1 page).
+ *
+ * This function checks that the pages involved in the mapping
+ * are correct, ie pmdptr is a level2, and val corresponds to
+ * a level1.
+ */
+SECURE_WRAPPER(void, nk_vmmu_update_l2_mapping,
+	       pde_t *pdePtr, page_entry_t val)
+{
+	nk_pmmu_update_l2_mapping(pdePtr, val);
+}
+
+/*
+ * Updates a level3 mapping
+ */
+SECURE_WRAPPER(void, nk_vmmu_update_l3_mapping,
+	       pdpte_t *pdptePtr, page_entry_t val)
+{
+	nk_pmmu_update_l3_mapping(pdptePtr, val);
+}
+
+/*
+ * Updates a level4 mapping
+ */
+SECURE_WRAPPER(void, nk_vmmu_update_l4_mapping,
+	       pml4e_t *pml4ePtr, page_entry_t val)
+{
+	nk_pmmu_update_l4_mapping(pml4ePtr, val);
+}
+
+/*
+ * Function: nk_vmmu_remove_mapping()
+ *
+ * Description:
+ *  This function updates the entry to the page table page and is agnostic to
+ *  the level of page table. The particular needs for each page table level are
+ *  handled in the __update_mapping function. The primary function here is to
+ *  set the mapping to zero, if the page was a PTP then zero it's data and set
+ *  it to writeable.
+ *
+ * Inputs:
+ *  pteptr - The location within the page table page for which the translation
+ *           should be removed.
+ */
+SECURE_WRAPPER(void, nk_vmmu_remove_mapping,
+	       page_entry_t *pteptr)
+{
+	nk_pmmu_remove_mapping(pteptr);
+}

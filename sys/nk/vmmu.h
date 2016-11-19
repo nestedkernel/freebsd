@@ -57,4 +57,16 @@ void	nk_load_pgtbl_base_ptr(register_t val);
 void	nk_vmmu_init(pml4e_t *kpml4Mapping, unsigned long nkpml4e,
 		     uintptr_t *firstpaddr, uintptr_t btext, uintptr_t etext);
 
+void	nk_vmmu_declare_l1_page(uintptr_t frame);
+void	nk_vmmu_declare_l2_page(uintptr_t frame);
+void	nk_vmmu_declare_l3_page(uintptr_t frame);
+void	nk_vmmu_declare_l4_page(uintptr_t frame);
+void	nk_vmmu_remove_page(uintptr_t frame);
+
+void	nk_vmmu_update_l1_mapping(pte_t *ptePtr, page_entry_t val);
+void	nk_vmmu_update_l2_mapping(pde_t *pdePtr, page_entry_t val);
+void	nk_vmmu_update_l3_mapping(pdpte_t *pdptePtr, page_entry_t val);
+void	nk_vmmu_update_l4_mapping(pml4e_t *pml4ePtr, page_entry_t val);
+void	nk_vmmu_remove_mapping(page_entry_t *ptePtr);
+
 #endif /* !__VMMU_H_ */

@@ -1034,7 +1034,11 @@ pmap_update_pde_action(void *arg)
 	struct pde_action *act = arg;
 
 	if (act->store == PCPU_GET(cpuid))
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l2_mapping(act->pde, act->newpde);
+#else
 		pde_store(act->pde, act->newpde);
+#endif
 }
 
 static void
@@ -1080,7 +1084,11 @@ pmap_update_pde(pmap_t pmap, vm_offset_t va, pd_entry_t *pde, pd_entry_t newpde)
 		    smp_no_rendevous_barrier, pmap_update_pde_action,
 		    pmap_update_pde_teardown, &act);
 	} else {
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l2_mapping(pde, newpde);
+#else
 		pde_store(pde, newpde);
+#endif
 		if (CPU_ISSET(cpuid, &active))
 			pmap_update_pde_invalidate(va, newpde);
 	}
@@ -1127,8 +1135,11 @@ pmap_invalidate_cache(void)
 static void
 pmap_update_pde(pmap_t pmap, vm_offset_t va, pd_entry_t *pde, pd_entry_t newpde)
 {
-
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l2_mapping(pde, newpde);
+#else
 	pde_store(pde, newpde);
+#endif
 	if (pmap == kernel_pmap || !CPU_EMPTY(&pmap->pm_active))
 		pmap_update_pde_invalidate(va, newpde);
 }
@@ -1336,7 +1347,11 @@ pmap_kenter(vm_offset_t va, vm_paddr_t pa)
 	pt_entry_t *pte;
 
 	pte = vtopte(va);
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l1_mapping(pte, pa | PG_RW | PG_V | PG_G);
+#else
 	pte_store(pte, pa | PG_RW | PG_V | PG_G);
+#endif
 }
 
 static __inline void
@@ -1345,7 +1360,12 @@ pmap_kenter_attr(vm_offset_t va, vm_paddr_t pa, int mode)
 	pt_entry_t *pte;
 
 	pte = vtopte(va);
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l1_mapping(pte, pa | PG_RW | PG_V | PG_G |
+				  pmap_cache_bits(mode, 0));
+#else
 	pte_store(pte, pa | PG_RW | PG_V | PG_G | pmap_cache_bits(mode, 0));
+#endif
 }
 
 /*
@@ -1358,7 +1378,11 @@ pmap_kremove(vm_offset_t va)
 	pt_entry_t *pte;
 
 	pte = vtopte(va);
+#ifdef NESTEDKERNEL
+	nk_vmmu_remove_mapping(pte);
+#else
 	pte_clear(pte);
+#endif
 }
 
 /*
@@ -1403,7 +1427,12 @@ pmap_qenter(vm_offset_t sva, vm_page_t *ma, int count)
 		pa = VM_PAGE_TO_PHYS(m) | pmap_cache_bits(m->md.pat_mode, 0);
 		if ((*pte & (PG_FRAME | PG_PTE_CACHE)) != pa) {
 			oldpte |= *pte;
+#ifdef NESTEDKERNEL
+			nk_vmmu_update_l1_mapping(pte,
+						  pa | PG_G | PG_RW | PG_V);
+#else
 			pte_store(pte, pa | PG_G | PG_RW | PG_V);
+#endif
 		}
 		pte++;
 	}
@@ -1460,6 +1489,9 @@ pmap_add_delayed_free_list(vm_page_t m, vm_page_t *free, boolean_t set_PG_ZERO)
 	else
 		m->flags &= ~PG_ZERO;
 	m->right = *free;
+#ifdef NESTEDKERNEL
+	nk_vmmu_remove_page(VM_PAGE_TO_PHYS(m));
+#endif
 	*free = m;
 }
 	
@@ -1570,17 +1602,29 @@ _pmap_unwire_pte_hold(pmap_t pmap, vm_offset_t va, vm_page_t m,
 		/* PDP page */
 		pml4_entry_t *pml4;
 		pml4 = pmap_pml4e(pmap, va);
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l4_mapping(pml4, 0);
+#else
 		*pml4 = 0;
+#endif
 	} else if (m->pindex >= NUPDE) {
 		/* PD page */
 		pdp_entry_t *pdp;
 		pdp = pmap_pdpe(pmap, va);
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l3_mapping(pdp, 0);
+#else
 		*pdp = 0;
+#endif
 	} else {
 		/* PTE page */
 		pd_entry_t *pd;
 		pd = pmap_pde(pmap, va);
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l2_mapping(pd, 0);
+#else
 		*pd = 0;
+#endif
 	}
 	pmap_resident_count_dec(pmap, 1);
 	if (m->pindex < NUPDE) {
@@ -1665,18 +1709,65 @@ pmap_pinit(pmap_t pmap)
 
 	pmap->pm_pml4 = (pml4_entry_t *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(pml4pg));
 
+#ifdef NESTEDKERNEL
+	/*
+	 * Due to the large page size mapping on PDEs in the DMAP we need to
+	 * demote the PDE to a set of PTs so that we can control the new PTPs
+	 * alone.
+	 */
+	pmap_demote_DMAP(VM_PAGE_TO_PHYS(pml4pg), PAGE_SIZE, FALSE);
+#endif
+
 	if ((pml4pg->flags & PG_ZERO) == 0)
 		pagezero(pmap->pm_pml4);
 
+#ifdef NESTEDKERNEL
+	/*
+	 * Declare the l4 page to NK. This will initialize paging structures
+	 * and make the page table page as read only.
+	 *
+	 * NK-TODO: Think more on how this pte is used for managing access to
+	 * this particular page. Instead should we setup something like the cr3
+	 * to capture this new data? Can we always assume the reference is in
+	 * this address? What if an attacker modifies it so that the self
+	 * references is somewhere else in memory? I suppose we are forcing the
+	 * mapping to be here for correct execution. So if the attacker changes
+	 * then it will automatically break the system.
+	 */
+	nk_vmmu_declare_l4_page(VM_PAGE_TO_PHYS(pml4pg));
+#endif
+
 	/* Wire in kernel global address entries. */
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l4_mapping(&pmap->pm_pml4[KPML4I],
+				  KPDPphys | PG_RW | PG_V | PG_U);
+#else
 	pmap->pm_pml4[KPML4I] = KPDPphys | PG_RW | PG_V | PG_U;
+#endif
 	for (i = 0; i < NDMPML4E; i++) {
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l4_mapping(&pmap->pm_pml4[DMPML4I + i],
+			(DMPDPphys + (i << PAGE_SHIFT)) | PG_RW | PG_V | PG_U);
+
+#else
 		pmap->pm_pml4[DMPML4I + i] = (DMPDPphys + (i << PAGE_SHIFT)) |
 		    PG_RW | PG_V | PG_U;
+#endif
 	}
 
+#ifdef NESTEDKERNEL
+	/*
+	 * Update the l4 self-referential address mapping to the newly created
+	 * page table page. Note that we place a self reference here, so we are
+	 * doing the update on the newly created l4 page table page we just
+	 * declared.
+	 */
+	nk_vmmu_update_l4_mapping(&pmap->pm_pml4[PML4PML4I],
+				  VM_PAGE_TO_PHYS(pml4pg) | PG_V | PG_RW | PG_A | PG_M);
+#else
 	/* install self-referential address mapping entry(s) */
 	pmap->pm_pml4[PML4PML4I] = VM_PAGE_TO_PHYS(pml4pg) | PG_V | PG_RW | PG_A | PG_M;
+#endif
 
 	pmap->pm_root = NULL;
 	CPU_ZERO(&pmap->pm_active);
@@ -1739,7 +1830,14 @@ _pmap_allocpte(pmap_t pmap, vm_pindex_t ptepindex, int flags)
 		/* Wire up a new PDPE page */
 		pml4index = ptepindex - (NUPDE + NUPDPE);
 		pml4 = &pmap->pm_pml4[pml4index];
+#ifdef NESTEDKERNEL
+		nk_vmmu_declare_l3_page(VM_PAGE_TO_PHYS(m));
+		nk_vmmu_update_l4_mapping(pml4,
+			VM_PAGE_TO_PHYS(m) | PG_U | PG_RW | PG_V | PG_A | PG_M);
+
+#else
 		*pml4 = VM_PAGE_TO_PHYS(m) | PG_U | PG_RW | PG_V | PG_A | PG_M;
+#endif
 
 	} else if (ptepindex >= NUPDE) {
 		vm_pindex_t pml4index;
@@ -1770,7 +1868,14 @@ _pmap_allocpte(pmap_t pmap, vm_pindex_t ptepindex, int flags)
 
 		/* Now find the pdp page */
 		pdp = &pdp[pdpindex & ((1ul << NPDPEPGSHIFT) - 1)];
+#ifdef NESTEDKERNEL
+		nk_vmmu_declare_l2_page(VM_PAGE_TO_PHYS(m));
+		nk_vmmu_update_l3_mapping(pdp,
+			VM_PAGE_TO_PHYS(m) | PG_U | PG_RW | PG_V | PG_A | PG_M);
+
+#else
 		*pdp = VM_PAGE_TO_PHYS(m) | PG_U | PG_RW | PG_V | PG_A | PG_M;
+#endif
 
 	} else {
 		vm_pindex_t pml4index;
@@ -1811,6 +1916,13 @@ _pmap_allocpte(pmap_t pmap, vm_pindex_t ptepindex, int flags)
 				}
 			} else {
 				/* Add reference to the pd page */
+				/*
+				 * NK TODO: here we are mapping in an already
+				 * mapped pd page.
+				 *
+				 * Do we need to also call an SVA function to
+				 * change the mapping counts?
+				 */
 				pdpg = PHYS_TO_VM_PAGE(*pdp & PG_FRAME);
 				pdpg->wire_count++;
 			}
@@ -1819,7 +1931,13 @@ _pmap_allocpte(pmap_t pmap, vm_pindex_t ptepindex, int flags)
 
 		/* Now we know where the page directory page is */
 		pd = &pd[ptepindex & ((1ul << NPDEPGSHIFT) - 1)];
+#ifdef NESTEDKERNEL
+		nk_vmmu_declare_l1_page(VM_PAGE_TO_PHYS(m));
+		nk_vmmu_update_l2_mapping(pd,
+			VM_PAGE_TO_PHYS(m) | PG_U | PG_RW | PG_V | PG_A | PG_M);
+#else
 		*pd = VM_PAGE_TO_PHYS(m) | PG_U | PG_RW | PG_V | PG_A | PG_M;
+#endif
 	}
 
 	pmap_resident_count_inc(pmap, 1);
@@ -1934,11 +2052,23 @@ pmap_release(pmap_t pmap)
 
 	pmap->pm_pml4[KPML4I] = 0;	/* KVA */
 	for (i = 0; i < NDMPML4E; i++)	/* Direct Map */
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l4_mapping(&pmap->pm_pml4[DMPML4I + i], 0);
+#else
 		pmap->pm_pml4[DMPML4I + i] = 0;
+#endif
+
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l4_mapping(&pmap->pm_pml4[PML4PML4I], 0);
+#else
 	pmap->pm_pml4[PML4PML4I] = 0;	/* Recursive Mapping */
+#endif
 
 	m->wire_count--;
 	atomic_subtract_int(&cnt.v_wire_count, 1);
+#ifdef NESTEDKERNEL
+	nk_vmmu_remove_page(VM_PAGE_TO_PHYS(m));
+#endif
 	vm_page_free_zero(m);
 	PMAP_LOCK_DESTROY(pmap);
 }
@@ -2009,8 +2139,14 @@ pmap_growkernel(vm_offset_t addr)
 			if ((nkpg->flags & PG_ZERO) == 0)
 				pmap_zero_page(nkpg);
 			paddr = VM_PAGE_TO_PHYS(nkpg);
+#ifdef NESTEDKERNEL
+			nk_vmmu_declare_l2_page(paddr);
+			nk_vmmu_update_l3_mapping(pdpe,
+				paddr | PG_V | PG_RW | PG_A | PG_M);
+#else
 			*pdpe = (pdp_entry_t)
 				(paddr | PG_V | PG_RW | PG_A | PG_M);
+#endif
 			continue; /* try again */
 		}
 		pde = pmap_pdpe_to_pde(pdpe, kernel_vm_end);
@@ -2032,7 +2168,12 @@ pmap_growkernel(vm_offset_t addr)
 			pmap_zero_page(nkpg);
 		paddr = VM_PAGE_TO_PHYS(nkpg);
 		newpdir = (pd_entry_t) (paddr | PG_V | PG_RW | PG_A | PG_M);
+#ifdef NESTEDKERNEL
+		nk_vmmu_declare_l1_page(paddr);
+		nk_vmmu_update_l2_mapping(pde, newpdir);
+#else
 		pde_store(pde, newpdir);
+#endif
 
 		kernel_vm_end = (kernel_vm_end + NBPDR) & ~PDRMASK;
 		if (kernel_vm_end - 1 >= kernel_map->max_offset) {
@@ -2135,7 +2276,18 @@ pmap_collect(pmap_t locked_pmap, struct vpgqueues *vpq)
 			KASSERT((*pde & PG_PS) == 0, ("pmap_collect: found"
 			    " a 2mpage in page %p's pv list", m));
 			pte = pmap_pde_to_pte(pde, va);
-			tpte = pte_load_clear(pte);
+#ifdef NESTEDKERNEL
+				/*
+				 * To emulate the proper behavior here we first
+				 * read the pte value then do an update mapping
+				 * to remove the mapping. Pass in a value of zero
+				 * to remove the mapping.
+				 */
+				tpte = *pte;
+				nk_vmmu_remove_mapping(pte);
+#else
+				tpte = pte_load_clear(pte);
+#endif
 			KASSERT((tpte & PG_W) == 0,
 			    ("pmap_collect: wired pte %#lx", tpte));
 			if (tpte & PG_A)
@@ -2150,6 +2302,7 @@ pmap_collect(pmap_t locked_pmap, struct vpgqueues *vpq)
 			free_pv_entry(pmap, pv);
 			if (pmap != locked_pmap)
 				PMAP_UNLOCK(pmap);
+
 		}
 		if (TAILQ_EMPTY(&m->md.pv_list) &&
 		    TAILQ_EMPTY(&pa_to_pvh(VM_PAGE_TO_PHYS(m))->pv_list))
@@ -2475,7 +2628,11 @@ pmap_fill_ptp(pt_entry_t *firstpte, pt_entry_t newpte)
 	pt_entry_t *pte;
 
 	for (pte = firstpte; pte < firstpte + NPTEPG; pte++) {
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l1_mapping(pte, newpte);
+#else
 		*pte = newpte;
+#endif
 		newpte += PAGE_SIZE;
 	}
 }
@@ -2542,6 +2699,14 @@ pmap_demote_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t va)
 	if ((newpte & PG_PDE_PAT) != 0)
 		newpte ^= PG_PDE_PAT | PG_PTE_PAT;
 
+#ifdef NESTEDKERNEL
+	/*
+	 * Declare the new PTE page as a page table page.
+	 * TODO: Maybe this should be moved into conditional below?
+	 */
+	nk_vmmu_declare_l1_page(mptepa);
+#endif
+
 	/*
 	 * If the page table page is new, initialize it.
 	 */
@@ -2570,7 +2735,15 @@ pmap_demote_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t va)
 	if (workaround_erratum383)
 		pmap_update_pde(pmap, va, pde, newpde);
 	else
+#ifdef NESTEDKERNEL
+		/* SVA update the mapping to the newly created pde
+		 * TODO this is a 2MB pde, we need to handle this in
+		 * the update function
+		 */
+		nk_vmmu_update_l2_mapping(pde, newpde);
+#else
 		pde_store(pde, newpde);
+#endif
 
 	/*
 	 * Invalidate a stale recursive mapping of the page table page.
@@ -2611,7 +2784,18 @@ pmap_remove_pde(pmap_t pmap, pd_entry_t *pdq, vm_offset_t sva,
 	PMAP_LOCK_ASSERT(pmap, MA_OWNED);
 	KASSERT((sva & PDRMASK) == 0,
 	    ("pmap_remove_pde: sva is not 2mpage aligned"));
+#ifdef NESTEDKERNEL
+	/*
+	 * To emulate the proper behavior here we first
+	 * read the pte value then do an update mapping
+	 * to remove the mapping. Pass in a value of zero
+	 * to remove the mapping.
+	 */
+	oldpde = *pdq;
+	nk_vmmu_remove_mapping(pdq);
+#else
 	oldpde = pte_load_clear(pdq);
+#endif
 	if (oldpde & PG_W)
 		pmap->pm_stats.wired_count -= NBPDR / PAGE_SIZE;
 
@@ -2666,7 +2850,18 @@ pmap_remove_pte(pmap_t pmap, pt_entry_t *ptq, vm_offset_t va,
 	vm_page_t m;
 
 	PMAP_LOCK_ASSERT(pmap, MA_OWNED);
+#ifdef NESTEDKERNEL
+	/*
+	 * To emulate the proper behavior here we first
+	 * read the pte value then do an update mapping
+	 * to remove the mapping. Pass in a value of zero
+	 * to remove the mapping.
+	 */
+	oldpte = *ptq;
+	nk_vmmu_remove_mapping(ptq);
+#else
 	oldpte = pte_load_clear(ptq);
+#endif
 	if (oldpte & PG_W)
 		pmap->pm_stats.wired_count -= 1;
 	pmap_resident_count_dec(pmap, 1);
@@ -2884,7 +3079,18 @@ pmap_remove_all(vm_page_t m)
 		KASSERT((*pde & PG_PS) == 0, ("pmap_remove_all: found"
 		    " a 2mpage in page %p's pv list", m));
 		pte = pmap_pde_to_pte(pde, pv->pv_va);
+#ifdef NESTEDKERNEL
+		/*
+		 * To emulate the proper behavior here we first
+		 * read the pte value then do an update mapping
+		 * to remove the mapping. Pass in a value of zero
+		 * to remove the mapping.
+		 */
+		tpte = *pte;
+		nk_vmmu_remove_mapping(pte);
+#else
 		tpte = pte_load_clear(pte);
+#endif
 		if (tpte & PG_W)
 			pmap->pm_stats.wired_count--;
 		if (tpte & PG_A)
@@ -2935,8 +3141,12 @@ retry:
 	if ((prot & VM_PROT_EXECUTE) == 0)
 		newpde |= pg_nx;
 	if (newpde != oldpde) {
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l2_mapping(pde, newpde);
+#else
 		if (!atomic_cmpset_long(pde, oldpde, newpde))
 			goto retry;
+#endif
 		if (oldpde & PG_G)
 			pmap_invalidate_page(pmap, sva);
 		else
@@ -3050,8 +3260,12 @@ retry:
 				pbits |= pg_nx;
 
 			if (pbits != obits) {
+#ifdef NESTEDKERNEL
+				nk_vmmu_update_l1_mapping(pte, pbits);
+#else
 				if (!atomic_cmpset_long(pte, obits, pbits))
 					goto retry;
+#endif
 				if (obits & PG_G)
 					pmap_invalidate_page(pmap, sva);
 				else
@@ -3101,8 +3315,12 @@ setpde:
 		 * When PG_M is already clear, PG_RW can be cleared without
 		 * a TLB invalidation.
 		 */
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l1_mapping(firstpte, newpde & ~PG_RW);
+#else
 		if (!atomic_cmpset_long(firstpte, newpde, newpde & ~PG_RW))
 			goto setpde;
+#endif
 		newpde &= ~PG_RW;
 	}
 
@@ -3126,8 +3344,12 @@ setpte:
 			 * When PG_M is already clear, PG_RW can be cleared
 			 * without a TLB invalidation.
 			 */
+#ifdef NESTEDKERNEL
+			nk_vmmu_update_l1_mapping(pte, oldpte & ~PG_RW);
+#else
 			if (!atomic_cmpset_long(pte, oldpte, oldpte & ~PG_RW))
 				goto setpte;
+#endif
 			oldpte &= ~PG_RW;
 			oldpteva = (oldpte & PG_FRAME & PDRMASK) |
 			    (va & ~PDRMASK);
@@ -3174,7 +3396,11 @@ setpte:
 	if (workaround_erratum383)
 		pmap_update_pde(pmap, va, pde, PG_PS | newpde);
 	else
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l2_mapping(pde, PG_PS | newpde);
+#else
 		pde_store(pde, PG_PS | newpde);
+#endif
 
 	pmap_pde_promotions++;
 	CTR2(KTR_PMAP, "pmap_promote_pde: success for va %#lx"
@@ -3338,7 +3564,13 @@ validate:
 			newpte |= PG_M;
 		if (origpte & PG_V) {
 			invlva = FALSE;
+#ifdef NESTEDKERNEL
+			/* SVA TODO Figure out what the heck this does */
+			origpte = *pte;
+			nk_vmmu_update_l1_mapping(pte, newpte);
+#else
 			origpte = pte_load_store(pte, newpte);
+#endif
 			if (origpte & PG_A) {
 				if (origpte & PG_MANAGED)
 					vm_page_aflag_set(om, PGA_REFERENCED);
@@ -3359,7 +3591,11 @@ validate:
 			if (invlva)
 				pmap_invalidate_page(pmap, va);
 		} else
+#ifdef NESTEDKERNEL
+			nk_vmmu_update_l1_mapping(pte, newpte);
+#else
 			pte_store(pte, newpte);
+#endif
 	}
 
 	/*
@@ -3435,7 +3671,11 @@ pmap_enter_pde(pmap_t pmap, vm_offset_t va, vm_page_t m, vm_prot_t prot)
 	/*
 	 * Map the superpage.
 	 */
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l2_mapping(pde, newpde);
+#else
 	pde_store(pde, newpde);
+#endif
 
 	pmap_pde_mappings++;
 	CTR2(KTR_PMAP, "pmap_enter_pde: success for va %#lx"
@@ -3598,9 +3838,17 @@ pmap_enter_quick_locked(pmap_t pmap, vm_offset_t va, vm_page_t m,
 	 * Now validate mapping with RO protection
 	 */
 	if ((m->oflags & VPO_UNMANAGED) != 0)
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l1_mapping(pte, pa | PG_V | PG_U);
+#else
 		pte_store(pte, pa | PG_V | PG_U);
+#endif
 	else
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l1_mapping(pte, pa | PG_V | PG_U | PG_MANAGED);
+#else
 		pte_store(pte, pa | PG_V | PG_U | PG_MANAGED);
+#endif
 	return (mpte);
 }
 
@@ -3691,8 +3939,18 @@ pmap_object_init_pt(pmap_t pmap, vm_offset_t addr, vm_object_t object,
 			pde = (pd_entry_t *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(pdpg));
 			pde = &pde[pmap_pde_index(addr)];
 			if ((*pde & PG_V) == 0) {
+#ifdef NESTEDKERNEL
+				/* SVA update the mapping to the newly created pde */
+				/* TODO this is a 2MB pde, we need to handle this
+				 * in the update function
+				 */
+				nk_vmmu_update_l2_mapping(pde,
+					(pa | PG_PS | PG_M | PG_A | PG_U |
+					PG_RW | PG_V));
+#else
 				pde_store(pde, pa | PG_PS | PG_M | PG_A |
 				    PG_U | PG_RW | PG_V);
+#endif
 				pmap_resident_count_inc(pmap, NBPDR / PAGE_SIZE);
 				pmap_pde_mappings++;
 			} else {
@@ -3749,10 +4007,18 @@ retry:
 	pte = pmap_pde_to_pte(pde, va);
 	if (wired && (*pte & PG_W) == 0) {
 		pmap->pm_stats.wired_count++;
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l1_mapping(pte, *pte | PG_W);
+#else
 		atomic_set_long(pte, PG_W);
+#endif
 	} else if (!wired && (*pte & PG_W) != 0) {
 		pmap->pm_stats.wired_count--;
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l1_mapping(pte, *pte & ~(PG_W));
+#else
 		atomic_clear_long(pte, PG_W);
+#endif
 	}
 out:
 	if (are_queues_locked)
@@ -3833,7 +4099,11 @@ pmap_copy(pmap_t dst_pmap, pmap_t src_pmap, vm_offset_t dst_addr, vm_size_t len,
 			if (*pde == 0 && ((srcptepaddr & PG_MANAGED) == 0 ||
 			    pmap_pv_insert_pde(dst_pmap, addr, srcptepaddr &
 			    PG_PS_FRAME))) {
+#ifdef NESTEDKERNEL
+				nk_vmmu_update_l2_mapping(pde, srcptepaddr & ~PG_W);
+#else
 				*pde = srcptepaddr & ~PG_W;
+#endif
 				pmap_resident_count_inc(dst_pmap, NBPDR / PAGE_SIZE);
 			} else
 				dstmpde->wire_count--;
@@ -3875,8 +4145,13 @@ pmap_copy(pmap_t dst_pmap, pmap_t src_pmap, vm_offset_t dst_addr, vm_size_t len,
 					 * accessed (referenced) bits
 					 * during the copy.
 					 */
+#ifdef NESTEDKERNEL
+					nk_vmmu_update_l1_mapping(dst_pte,
+						ptetemp & ~(PG_W | PG_M | PG_A));
+#else
 					*dst_pte = ptetemp & ~(PG_W | PG_M |
 					    PG_A);
+#endif
 					pmap_resident_count_inc(dst_pmap, 1);
 	 			} else {
 					free = NULL;
@@ -4138,7 +4413,11 @@ pmap_remove_pages(pmap_t pmap)
 					("pmap_remove_pages: bad tpte %#jx",
 					(uintmax_t)tpte));
 
+#ifdef NESTEDKERNEL
+				nk_vmmu_remove_mapping(pte);
+#else
 				pte_clear(pte);
+#endif
 
 				/*
 				 * Update the vm_page_t clean/reference bits.
@@ -4377,9 +4656,14 @@ pmap_remove_write(vm_page_t m)
 retry:
 		oldpte = *pte;
 		if (oldpte & PG_RW) {
+#ifdef NESTEDKERNEL
+			nk_vmmu_update_l1_mapping(pte,
+				oldpte & ~(PG_RW | PG_M));
+#else
 			if (!atomic_cmpset_long(pte, oldpte, oldpte &
 			    ~(PG_RW | PG_M)))
 				goto retry;
+#endif
 			if ((oldpte & PG_M) != 0)
 				vm_page_dirty(m);
 			pmap_invalidate_page(pmap, pv->pv_va);
@@ -4460,7 +4744,11 @@ pmap_ts_referenced(vm_page_t m)
 			    " found a 2mpage in page %p's pv list", m));
 			pte = pmap_pde_to_pte(pde, pv->pv_va);
 			if ((*pte & PG_A) != 0) {
+#ifdef NESTEDKERNEL
+				nk_vmmu_update_l1_mapping(pte, *pte & ~PG_A);
+#else
 				atomic_clear_long(pte, PG_A);
+#endif
 				pmap_invalidate_page(pmap, pv->pv_va);
 				rtval++;
 				if (rtval > 4)
@@ -4521,10 +4809,15 @@ pmap_clear_modify(vm_page_t m)
 					pte = pmap_pde_to_pte(pde, va);
 					oldpte = *pte;
 					if ((oldpte & PG_V) != 0) {
+#ifdef NESTEDKERNEL
+						nk_vmmu_update_l1_mapping(pte,
+							oldpte & ~(PG_M | PG_RW));
+#else
 						while (!atomic_cmpset_long(pte,
 						    oldpte,
 						    oldpte & ~(PG_M | PG_RW)))
 							oldpte = *pte;
+#endif
 						vm_page_dirty(m);
 						pmap_invalidate_page(pmap, va);
 					}
@@ -4541,7 +4834,11 @@ pmap_clear_modify(vm_page_t m)
 		    " a 2mpage in page %p's pv list", m));
 		pte = pmap_pde_to_pte(pde, pv->pv_va);
 		if ((*pte & (PG_M | PG_RW)) == (PG_M | PG_RW)) {
+#ifdef NESTEDKERNEL
+			nk_vmmu_update_l1_mapping(pte, *pte & (~PG_M));
+#else
 			atomic_clear_long(pte, PG_M);
+#endif
 			pmap_invalidate_page(pmap, pv->pv_va);
 		}
 		PMAP_UNLOCK(pmap);
@@ -4598,7 +4895,11 @@ pmap_clear_reference(vm_page_t m)
 		    " a 2mpage in page %p's pv list", m));
 		pte = pmap_pde_to_pte(pde, pv->pv_va);
 		if (*pte & PG_A) {
+#ifdef NESTEDKERNEL
+			nk_vmmu_update_l1_mapping(pte, *pte & (~PG_A));
+#else
 			atomic_clear_long(pte, PG_A);
+#endif
 			pmap_invalidate_page(pmap, pv->pv_va);
 		}
 		PMAP_UNLOCK(pmap);
@@ -4620,11 +4921,20 @@ pmap_pte_attr(pt_entry_t *pte, int cache_bits)
 	 * The cache mode bits are all in the low 32-bits of the
 	 * PTE, so we can just spin on updating the low 32-bits.
 	 */
+#ifdef NESTEDKERNEL
+	do {
+		opte = *(u_int *)pte;
+		npte = opte & ~PG_PTE_CACHE;
+		npte |= cache_bits;
+		nk_vmmu_update_l1_mapping(pte, npte);
+	} while (npte != opte);
+#else
 	do {
 		opte = *(u_int *)pte;
 		npte = opte & ~PG_PTE_CACHE;
 		npte |= cache_bits;
 	} while (npte != opte && !atomic_cmpset_int((u_int *)pte, opte, npte));
+#endif
 }
 
 /* Adjust the cache mode for a 2MB page mapped via a PDE. */
@@ -4637,11 +4947,20 @@ pmap_pde_attr(pd_entry_t *pde, int cache_bits)
 	 * The cache mode bits are all in the low 32-bits of the
 	 * PDE, so we can just spin on updating the low 32-bits.
 	 */
+#ifdef NESTEDKERNEL
+	do {
+		opde = *(u_int *)pde;
+		npde = opde & ~PG_PDE_CACHE;
+		npde |= cache_bits;
+		nk_vmmu_update_l2_mapping(pde, npde);
+	} while (npde != opde);
+#else
 	do {
 		opde = *(u_int *)pde;
 		npde = opde & ~PG_PDE_CACHE;
 		npde |= cache_bits;
 	} while (npde != opde && !atomic_cmpset_int((u_int *)pde, opde, npde));
+#endif
 }
 
 /*
@@ -4712,6 +5031,7 @@ pmap_unmapdev(vm_offset_t va, vm_size_t size)
 /*
  * Tries to demote a 1GB page mapping.
  */
+ /* NK-TODO: analyze the remainder of this function to find declares */
 static boolean_t
 pmap_demote_pdpe(pmap_t pmap, pdp_entry_t *pdpe, vm_offset_t va)
 {
@@ -4731,6 +5051,9 @@ pmap_demote_pdpe(pmap_t pmap, pdp_entry_t *pdpe, vm_offset_t va)
 		return (FALSE);
 	}
 	mpdepa = VM_PAGE_TO_PHYS(mpde);
+#ifdef NESTEDKERNEL
+	nk_vmmu_declare_l2_page(mpdepa);
+#endif
 	firstpde = (pd_entry_t *)PHYS_TO_DMAP(mpdepa);
 	newpdpe = mpdepa | PG_M | PG_A | (oldpdpe & PG_U) | PG_RW | PG_V;
 	KASSERT((oldpdpe & PG_A) != 0,
@@ -4743,14 +5066,22 @@ pmap_demote_pdpe(pmap_t pmap, pdp_entry_t *pdpe, vm_offset_t va)
 	 * Initialize the page directory page.
 	 */
 	for (pde = firstpde; pde < firstpde + NPDEPG; pde++) {
+#ifdef NESTEDKERNEL
+		nk_vmmu_update_l2_mapping(pde, newpde);
+#else
 		*pde = newpde;
+#endif
 		newpde += NBPDR;
 	}
 
 	/*
 	 * Demote the mapping.
 	 */
+#ifdef NESTEDKERNEL
+	nk_vmmu_update_l3_mapping(pdpe, newpdpe);
+#else
 	*pdpe = newpdpe;
+#endif
 
 	/*
 	 * Invalidate a stale recursive mapping of the page directory page.

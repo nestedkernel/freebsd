@@ -193,6 +193,63 @@ DECLARE_NK_DATA(static const uintptr_t, ZERO_MAPPING) = 0;
 /* Mask to get the address bits out of a PTE, PDE, etc. */
 DECLARE_NK_DATA(static const uintptr_t, addrmask) = 0x000ffffffffff000u;
 
+
+/*****************************************************************************
+ * Define helper functions for MMU operations
+ *****************************************************************************/
+
+/*
+ * Function: _mm_flush_tlb()
+ *
+ * Description:
+ *  Flush all TLB's holding translations for the specified virtual address.
+ *
+ * Notes:
+ *  I had to look at the FreeBSD implementation of invlpg() to figure out that
+ *  you need to "dereference" the address to get the operand to the inline asm
+ *  constraint to work properly.  While perhaps not necessary (because I don't
+ *  think such a trivial thing can by copyrighted), the fact that I referenced
+ *  the FreeBSD code is why we have the BSD copyright and attribute comment at
+ *  the top of this file.
+ */
+static inline void
+_mm_flush_tlb (void *address)
+{
+	__asm __volatile("invlpg %0" : : "m" (*((char *)address)) : "memory");
+}
+
+/*
+ * Function: page_entry_store
+ *
+ * Description:
+ *  This function takes a pointer to a page table entry and updates its value
+ *  to the new value provided.
+ *
+ * Assumptions:
+ *  - This function assumes that write protection is enabled in CR0 (WP bit set
+ *    to 1).
+ *
+ * Inputs:
+ *  *page_entry -: A pointer to the page entry to store the new value to, a
+ *                 valid VA for accessing the page_entry.
+ *  newVal      -: The new value to store, including the address of the
+ *                 referenced page.
+ *
+ * Side Effect:
+ *  - This function enables system wide write protection in CR0.
+ */
+static inline void
+page_entry_store(unsigned long *page_entry, page_entry_t newVal)
+{
+	/* Write the new value to the page_entry */
+	*page_entry = newVal;
+
+	/*
+	 * TODO: Add a check here to make sure the value matches
+	 * the one passed in
+	 */
+}
+
 /*----------------------------------------------------------------------------*
  *===-- pMMU Utility Functions --------------------------------------------===*
  *----------------------------------------------------------------------------*/
@@ -877,4 +934,761 @@ pmmu_init(pml4e_t *kpml4Mapping, unsigned long nkpml4e,
 #endif
 
 	NKDEBUG(mmu_init, "Completed MMU init");
+}
+
+/*
+ * Function: updateNewPageData
+ *
+ * Description:
+ *  This function is called whenever we are inserting a new mapping into a page
+ *  entry. The goal is to manage any SVA page data that needs to be set for
+ *  tracking the new mapping with the existing page data. This is essential to
+ *  enable the MMU verification checks.
+ *
+ * Inputs:
+ *  mapping - The new mapping to be inserted in x86_64 page table format.
+ */
+static inline void
+updateNewPageData(page_entry_t mapping)
+{
+	uintptr_t newPA = mapping & PG_FRAME;
+	unsigned long newFrame = newPA >> PAGESHIFT;
+	uintptr_t newVA = (uintptr_t) getVirtual(newPA);
+	page_desc_t *newPG = getPageDescPtr(mapping);
+
+	/*
+	 * If the new mapping is valid, update the counts for it.
+	 */
+	if (mapping & PG_V) {
+#if 0
+		/*
+		 * If the new page is to a page table page and this is the first
+		 * reference to the page, we need to set the VA mapping this
+		 * page so that the verification routine can enforce that this
+		 * page is only mapped to a single VA. Note that if we have
+		 * gotten here, we know that we currently do not have a mapping
+		 * to this page already, which means this is the first mapping
+		 * to the page.
+		 */
+		if (newPG->type >= PG_L1 && newPG->type <= PG_L4)
+			newPG->pgVaddr = newVA;
+#endif
+
+		/*
+		 * Update the reference count for the new page frame. Check
+		 * that we aren't overflowing the counter.
+		 */
+		if (newPG->count >= ((1u << 13) - 1))
+			panic("MMU: overflow for the mapping count");
+		newPG->count++;
+
+		/*
+		 * Set the VA of this entry if it is the first mapping to a
+		 * page table page.
+		 */
+	}
+}
+
+/*
+ * Function: updateOrigPageData
+ *
+ * Description:
+ *  This function updates the metadata for a page that is being removed from
+ *  the mapping.
+ *
+ * Inputs:
+ *  mapping - An x86_64 page table entry describing the old mapping of the page
+ */
+static inline void
+updateOrigPageData(page_entry_t mapping)
+{
+	page_desc_t *origPG = getPageDescPtr(mapping);
+
+	/*
+	 * Only decrement the mapping count if the page has an existing valid
+	 * mapping.  Ensure that we don't drop the reference count below zero.
+	 */
+	if ((mapping & PG_V) && (origPG->count)) {
+		--(origPG->count);
+	}
+}
+
+/*
+ * Function: _do_mmu_update
+ *
+ * Description:
+ *  If the update has been validated, this function manages metadata by
+ *  updating the internal SVA reference counts for pages and then performs the
+ *  actual update.
+ *
+ * Inputs:
+ *  *page_entry  - VA pointer to the page entry being modified
+ *  newVal       - Representes the mapping to insert into the page_entry
+ */
+static inline void
+_do_mmu_update(pte_t *pteptr, page_entry_t mapping)
+{
+	uintptr_t origPA = *pteptr & PG_FRAME;
+	uintptr_t newPA = mapping & PG_FRAME;
+
+	/*
+	 * If we have a new mapping as opposed to just changing the flags of an
+	 * existing mapping, then update the SVA meta data for the pages. We
+	 * know that we have passed the validation checks so these updates have
+	 * been vetted.
+	 */
+	if (newPA != origPA) {
+		updateOrigPageData(*pteptr);
+		updateNewPageData(mapping);
+	} else if ((*pteptr & PG_V) && ((mapping & PG_V) == 0)) {
+		/*
+		 * If the old mapping is marked valid but the new mapping is
+		 * not, then decrement the reference count of the old page.
+		 */
+		updateOrigPageData(*pteptr);
+	} else if (((*pteptr & PG_V) == 0) && (mapping & PG_V)) {
+		/*
+		 * Contrariwise, if the old mapping is invalid but the new
+		 * mapping is valid, then increment the reference count of
+		 * the new page.
+		 */
+		updateNewPageData(mapping);
+	}
+
+	/* Perform the actual write to into the page table entry */
+	page_entry_store((page_entry_t *) pteptr, mapping);
+	return;
+}
+
+/*
+ * Function: initDeclaredPage
+ *
+ * Description:
+ *  This function zeros out the physical page pointed to by frameAddr and
+ *  changes the permissions of the page in the direct map to read-only.
+ *  This function is agnostic as to which level page table entry we are
+ *  modifying because the format of the entry is the same in all cases.
+ *
+ * Assumption: This function should only be called by a declare intrinsic.
+ *      Otherwise it has side effects that may break the system.
+ *
+ * Inputs:
+ *  frameAddr: represents the physical address of this frame
+ *
+ *  *page_entry: A pointer to a page table entry that will be used to
+ *      initialize the mapping to this newly created page as read only. Note
+ *      that the address of the page_entry must be a virtually accessible
+ *      address.
+ */
+static inline void
+initDeclaredPage(unsigned long frameAddr)
+{
+	/*
+	 * Get the direct map virtual address of the physical address.
+	 */
+	unsigned char *vaddr = getVirtual(frameAddr);
+
+	/*
+	 * Get a pointer to the page table entry that maps the physical page
+	 * into the direct map.
+	 */
+	page_entry_t *page_entry = get_pgeVaddr(vaddr);
+
+	/*
+	 * Initialize the contents of the page to zero.  This will ensure that
+	 * no existing page translations which have not been vetted exist
+	 * within the page.
+	 */
+	memset(vaddr, 0, PAGESIZE);
+
+	if (page_entry && (*page_entry & PG_PS) == 0) {
+		/*
+		 * Make the direct map entry for the page read-only to ensure
+		 * that the OS goes through SVA to make page table changes.
+		 *
+		 * Also be sure to flush the TLBs for the direct map address
+		 * to ensure that it's made read-only right away.
+		 */
+		page_entry_store(page_entry, setMappingReadOnly(*page_entry));
+		_mm_flush_tlb(vaddr);
+	}
+}
+
+static void _nk_pmmu_declare_page(uintptr_t frameAddr, enum page_type_t type)
+{
+	/* Get the page_desc for the newly declared <type> page frame */
+	page_desc_t *pgDesc = getPageDescPtr(frameAddr);
+
+	/*
+	 * Make sure that this is already a <type> page, an unused page, or a
+	 * kernel data page.
+	 */
+	if (pgDesc->type != type &&
+	    pgDesc->type != PG_UNUSED &&
+	    pgDesc->type != PG_TKDATA) {
+		printf("SVA: %lx %lx\n", page_desc, page_desc + NUMPGDESCENTRIES);
+		panic("SVA: Declaring L%d for wrong page: frameAddr = %lx, pgDesc=%lx, type=%x\n",
+		      type, frameAddr, pgDesc, pgDesc->type);
+	}
+
+	/*
+	 * Declare the page as a <type> page (unless it is already
+	 * a <type> page).
+	 */
+	if (pgDesc->type != type) {
+		/* Mark this page frame as an L1 page frame.*/
+		pgDesc->type = type;
+
+		/* Reset the VA which can point to this page table page. */
+		pgDesc->pgVaddr = 0;
+
+		/*
+		 * Initialize the page data and page entry. Note that we pass
+		 * a general page_entry_t to the function as it enables reuse of
+		 * code for each of the entry declaration functions.
+		 */
+		initDeclaredPage(frameAddr);
+	}
+}
+
+/*
+ * Intrinsic: nk_pmmu_declare_l1_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 1 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 1 page frame.
+ */
+void nk_pmmu_declare_l1_page(uintptr_t frameAddr)
+{
+	_nk_pmmu_declare_page(frameAddr, PG_L1);
+}
+
+/*
+ * Intrinsic: nk_pmmu_declare_l2_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 2 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 2 page frame.
+ */
+void nk_pmmu_declare_l2_page(uintptr_t frameAddr)
+{
+	_nk_pmmu_declare_page(frameAddr, PG_L2);
+}
+
+/*
+ * Intrinsic: nk_pmmu_declare_l3_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 3 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 3 page frame.
+ */
+void nk_pmmu_declare_l3_page(uintptr_t frameAddr)
+{
+	_nk_pmmu_declare_page(frameAddr, PG_L3);
+}
+
+/*
+ * Intrinsic: nk_pmmu_declare_l4_page()
+ *
+ * Description:
+ *  This intrinsic marks the specified physical frame as a Level 4 page table
+ *  frame.  It will zero out the contents of the page frame so that stale
+ *  mappings within the frame are not used by the MMU.
+ *
+ * Inputs:
+ *  frameAddr - The address of the physical page frame that will be used as a
+ *              Level 4 page frame.
+ */
+void nk_pmmu_declare_l4_page(uintptr_t frameAddr)
+{
+	_nk_pmmu_declare_page(frameAddr, PG_L4);
+}
+
+/*
+ * Function: nk_pmmu_remove_page()
+ *
+ * Description:
+ *  This function informs the NK VM that the system software no longer wants
+ *  to use the specified page as a page table page.
+ *
+ * Inputs:
+ *  paddr - The physical address of the page table page.
+ */
+void nk_pmmu_remove_page(uintptr_t paddr)
+{
+	/* Get the entry controlling the permissions for this pte PTP */
+	page_entry_t *pte = get_pgeVaddr(getVirtual(paddr));
+
+	/* Get the page_desc for the l1 page frame */
+	page_desc_t *pgDesc = getPageDescPtr(paddr);
+
+	/*
+	 * Make sure that this is a page table page.  We don't want the system
+	 * software to trick us.
+	 */
+	switch (pgDesc->type)  {
+	case PG_L1:
+	case PG_L2:
+	case PG_L3:
+	case PG_L4:
+		break;
+	default:
+		panic("NK: undeclare bad page type: %lx %lx\n",
+		      paddr, pgDesc->type);
+	}
+
+	/*
+	 * Check that there are no references to this page (i.e.: there is no
+	 * page table entry that refers to this physical page frame). If there
+	 * is a mapping, then someone is still using it as a page table page. In
+	 * that case, ignore the request.
+	 *
+	 * Note that we check for a reference count of 1 because the page is
+	 * always mapped into the direct map.
+	 */
+	if (pgDesc->count == 1 || pgDesc->count == 0) {
+		/*
+		 * Mark the page frame as an unused page.
+		 */
+		pgDesc->type = PG_UNUSED;
+
+		/*
+		 * Make the page writeable again.  Be sure to flush the TLBs to
+		 * make the change take effect right away.
+		 */
+		page_entry_store((page_entry_t *) pte,
+				 setMappingReadWrite(*pte));
+		_mm_flush_tlb(getVirtual(paddr));
+	} else {
+		printf("NK: remove_page: type=%x count %x\n",
+			pgDesc->type, pgDesc->count);
+	}
+}
+
+#define PT_UPDATE_INVALID	0
+#define PT_UPDATE_VALID_RO	1
+#define PT_UPDATE_VALID		2
+
+static inline int
+isFramePg(page_desc_t *page)
+{
+	return
+		(page->type == PG_UNUSED) ||	/* Defines an unused page */
+		(page->type == PG_TKDATA) ||	/* Defines a kernel data page */
+		(page->type == PG_TUDATA) ||	/* Defines a user data page */
+		(page->type == PG_CODE);	/* Defines a code page */
+}
+
+/*
+ * Function: _pt_update_is_valid()
+ *
+ * Description:
+ *  This function assesses a potential page table update for a valid mapping.
+ *
+ *  NOTE: This function assumes that the page being mapped in has already been
+ *  declared and has its intial page metadata captured as defined in the
+ *  initial mapping of the page.
+ *
+ * Inputs:
+ *  *page_entry  - VA pointer to the page entry being modified
+ *  newVal       - Representes the new value to write including the reference
+ *                 to the underlying mapping.
+ *
+ * Return:
+ *  PT_UPDATE_INVALID  - The update is not valid and should not be performed.
+ *  PT_UPDATE_VALID_RO - The update is valid but should disable write access.
+ *  PT_UPDATE_VALID    - The update is valid and can be performed.
+ */
+static int _pt_update_is_valid(page_entry_t *page_entry, page_entry_t newVal)
+{
+	/* Collect associated information for the existing mapping */
+	unsigned long origPA = *page_entry & PG_FRAME;
+	unsigned long origFrame = origPA >> PAGESHIFT;
+	uintptr_t origVA = (uintptr_t) getVirtual(origPA);
+
+	page_desc_t *origPG = getPageDescPtr(origPA);
+
+	/* Get associated information for the new page being mapped */
+	unsigned long newPA = newVal & PG_FRAME;
+	unsigned long newFrame = newPA >> PAGESHIFT;
+	uintptr_t newVA = (uintptr_t) getVirtual(newPA);
+	page_desc_t *newPG = getPageDescPtr(newVal);
+
+	/* Get the page table page descriptor. The page_entry is the viratu */
+	uintptr_t ptePAddr = getPhysicalAddr (page_entry);
+	page_desc_t *ptePG = getPageDescPtr(ptePAddr);
+
+	/* Return value */
+	unsigned char retValue = PT_UPDATE_VALID_RO;
+
+	/*
+	 * Determine if the page table pointer is within the direct map. If not,
+	 * then it's an error.
+	 *
+	 * TODO: This check can cause a panic because the SVA VM does not set
+	 *       up the direct map before starting the kernel. As a result, we
+	 *       get page table addresses that don't fall into the direct map.
+	 */
+#if REVIEW_OBSOLETE // nk doesn't require DMAP only aliases
+	SVA_NOOP_ASSERT(isDirectMap (page_entry), "SVA: MMU: Not direct map\n");
+#endif
+
+	/*
+	 * Add check that the direct map is not being modified.
+	 *
+	 * TODO: This should be a check to make sure that we are updating a
+	 * PTP page.
+	 */
+	if (PG_DML1 <= ptePG->type && ptePG->type <= PG_DML4)
+		panic ("SVA: MMU: Modifying direct map!\n");
+
+	/*
+	 * If we aren't mapping a new page then we can skip several checks, and in
+	 * some cases we must, otherwise, the checks will fail. For example if this
+	 * is a mapping in a page table page then we allow a zero mapping.
+	 */
+	if (newVal & PG_V) {
+#if REVIEW_OBSOLETE
+		/* If the mapping is to an SVA page then fail */
+		SVA_ASSERT(!isSVAPg(newPG), "Kernel attempted to map an SVA page");
+#endif
+
+		/*
+		 * New mappings to code pages are permitted as long as they are
+		 * either for user-space pages or do not permit write access.
+		 */
+		if (newPG->type == PG_CODE) {
+			if ((newVal & (PG_RW | PG_U)) == (PG_RW)) {
+				panic("SVA: Making kernel code writeable: %lx %lx\n",
+				      newVA, newVal);
+			}
+		}
+
+		/*
+		 * If the new page is a page table page, then we verify some
+		 * page table page specific checks.
+		 */
+		if (newPG->type >= PG_L1 && newPG->type <= PG_L4) {
+			/*
+			 * If we have a page table page being mapped in and it
+			 * currently has a mapping to it, then we verify that
+			 * the new VA from the new mapping matches the existing
+			 * currently mapped VA.
+			 *
+			 * This guarantees that we each page table page (and the
+			 * translations within it) maps a singular region of the
+			 * address space.
+			 *
+			 * Otherwise, this is the first mapping of the page, and
+			 * we should record in what virtual address it is being
+			 * placed.
+			 */
+#if 0
+			if (newPG->count > 1) {
+				if (newPG->pgVaddr != page_entry) {
+					panic("SVA: PG: %lx %lx: type=%x\n",
+					      newPG->pgVaddr, page_entry,
+					      newPG->type);
+				}
+				SVA_ASSERT (newPG->pgVaddr == page_entry, "MMU: Map PTP to second VA");
+			} else {
+				newPG->pgVaddr = page_entry;
+			}
+#endif
+		}
+
+		/*
+		 * Verify that that the mapping matches the correct type of page
+		 * allowed to be mapped into this page table. Verify that the new
+		 * PTP is of the correct type given the page level of the page
+		 * entry.
+		 */
+		switch (ptePG->type) {
+		case PG_L1:
+			if (!isFramePg(newPG)) {
+				/*
+				 * If it is a page table page, just ensure that it is not writeable.
+				 * The kernel may be modifying the direct map, and we will permit
+				 * that as long as it doesn't make page tables writeable.
+				 *
+				 * Note: The SVA VM really should have its own direct map that the
+				 *       kernel cannot use or modify, but that is too much work, so
+				 *       we make this compromise.
+				 */
+				if (newPG->type >= PG_L1 && newPG->type <= PG_L4)
+					retValue = PT_UPDATE_VALID_RO;
+				else
+					panic("SVA: MMU: Map bad page type into L1: %x\n", newPG->type);
+			}
+			break;
+		case PG_L2:
+			if (newVal & PG_PS) {
+				if (!isFramePg(newPG)) {
+					/*
+					 * If it is a page table page, just ensure that it is not writeable.
+					 * The kernel may be modifying the direct map, and we will permit
+					 * that as long as it doesn't make page tables writeable.
+					 *
+					 * Note: The SVA VM really should have its own direct map that the
+					 *       kernel cannot use or modify, but that is too much work, so
+					 *       we make this compromise.
+					 */
+					if (newPG->type >= PG_L1 && newPG->type <= PG_L4)
+						retValue = PT_UPDATE_VALID_RO;
+					else
+						panic("SVA: MMU: Map bad page type into L2: %x\n",
+						      newPG->type);
+				}
+			} else {
+				if (newPG->type != PG_L1)
+					panic("MMU: Mapping non-L1 page into L2.");
+			}
+			break;
+		case PG_L3:
+			if (newVal & PG_PS) {
+				if (!isFramePg(newPG)) {
+					/*
+					 * If it is a page table page, just ensure that it is not writeable.
+					 * The kernel may be modifying the direct map, and we will permit
+					 * that as long as it doesn't make page tables writeable.
+					 *
+					 * Note: The SVA VM really should have its own direct map that the
+					 *       kernel cannot use or modify, but that is too much work, so
+					 *       we make this compromise.
+					 */
+					if (newPG->type >= PG_L1 && newPG->type <= PG_L4)
+						retValue = PT_UPDATE_VALID_RO;
+					else
+						panic("SVA: MMU: Map bad page type into L2: %x\n",
+						      newPG->type);
+				}
+			} else {
+				if (newPG->type != PG_L2)
+					panic("MMU: Mapping non-L2 page into L3.");
+			}
+			break;
+		case PG_L4:
+			/*
+			 * FreeBSD inserts a self mapping into the pml4, therefore it is
+			 * valid to map in an L4 page into the L4.
+			 *
+			 * TODO: Consider the security implications of allowing an L4 to map
+			 *       an L4.
+			 */
+			if (newPG->type != PG_L3 && newPG->type != PG_L4)
+				panic("MMU: Mapping non-L3/L4 page into L4.");
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	/*
+	 * If the new mapping is set for user access, but the VA being used is
+	 * to kernel space, fail. Also capture in this check is if the new
+	 * mapping is set for super user access, but the VA being used is to
+	 * user space, fail.
+	 *
+	 * 3 things to assess for matches:
+	 *  - U/S Flag of new mapping
+	 *  - Type of the new mapping frame
+	 *  - Type of the PTE frame
+	 *
+	 * Ensures the new mapping U/S flag matches the PT page frame type and
+	 * the mapped in frame's page type, as well as no mapping kernel code
+	 * pages into userspace.
+	 */
+
+	/*
+	 * If the original PA is not equivalent to the new PA then we are
+	 * creating an entirely new mapping, thus make sure that this is a valid
+	 * new page reference. Also verify that the reference counts to the old
+	 * page are sane, i.e., there is at least a current count of 1 to it.
+	 */
+	if (origPA != newPA) {
+		/*
+		 * If the old mapping was to a code page then we know we
+		 * shouldn't be pointing this entry to another code page,
+		 * thus fail.
+		 */
+		if (origPG->type == PG_CODE) {
+			if (!(*page_entry & PG_U))
+				panic("Kernel attempting to modify code page mapping");
+		}
+	}
+
+	return retValue;
+}
+
+/*
+ * Function: _update_mapping
+ *
+ * Description:
+ *  Mapping update function that is agnostic to the level of page table. Most
+ *  of the verification code is consistent regardless of which level page
+ *  update we are doing.
+ *
+ * Inputs:
+ *  - pageEntryPtr : reference to the page table entry to insert the mapping
+ *      into
+ *  - val : new entry value
+ */
+static void _update_mapping(pte_t *pageEntryPtr, page_entry_t val)
+{
+	int ret;
+
+	/*
+	 * If the given page update is valid then store the new value to the page
+	 * table entry, else raise an error.
+	 */
+	ret = _pt_update_is_valid((page_entry_t *) pageEntryPtr, val);
+	switch (ret) {
+	case PT_UPDATE_VALID_RO:
+		/*
+		 * Kernel thinks these should be RW, since it wants to
+		 * write to them.
+		 * Convert to read-only and carry on.
+		 */
+		val = setMappingReadOnly(val);
+	case PT_UPDATE_VALID:
+		_do_mmu_update((page_entry_t *) pageEntryPtr, val);
+		break;
+	default:
+		panic("##### NK invalid page update!!!\n");
+	}
+}
+
+/*
+ * Function: nk_pmmu_update_l1_mapping()
+ *
+ * Description:
+ *  This function updates a Level-1 Mapping.  In other words, it adds a
+ *  a direct translation from a virtual page to a physical page.
+ *
+ *  This function makes different checks to ensure the mapping
+ *  does not bypass the type safety proved by the compiler.
+ *
+ * Inputs:
+ *  pteptr - The location within the L1 page in which the new translation
+ *           should be place.
+ *  val    - The new translation to insert into the page table.
+ */
+void nk_pmmu_update_l1_mapping(pte_t *pteptr, page_entry_t val)
+{
+	/*
+	 * Ensure that the PTE pointer points to an L1 page table.
+	 * If it does not, then report an error.
+	 */
+	page_desc_t *ptDesc = getPageDescPtr(getPhysicalAddr(pteptr));
+
+	if (ptDesc->type != PG_L1)
+		panic("NK: MMU: update_l1 not an L1: %lx %lx: %lx\n",
+		      pteptr, val, ptDesc->type);
+
+	/*
+	 * Update the page table with the new mapping.
+	 */
+	// printf("[NK] update_l1: pteptr=%p\n", pteptr);
+	_update_mapping(pteptr, val);
+}
+
+/*
+ * Updates a level2 mapping (a mapping to a l1 page).
+ *
+ * This function checks that the pages involved in the mapping
+ * are correct, ie pmdptr is a level2, and val corresponds to
+ * a level1.
+ */
+void nk_pmmu_update_l2_mapping(pde_t *pdePtr, page_entry_t val)
+{
+	/*
+	 * Ensure that the PTE pointer points to an L1 page table.
+	 * If it does not, then report an error.
+	 */
+	page_desc_t *ptDesc = getPageDescPtr(getPhysicalAddr(pdePtr));
+
+	if (ptDesc->type != PG_L2)
+		panic("NK: MMU: update_l2 not an L2: %lx %lx: %lx\n",
+		      pdePtr, val, ptDesc->type);
+
+	/*
+	 * Update the page mapping.
+	 */
+	// printf("[NK] update_l2: pdeptr=%p\n", pdePtr);
+	_update_mapping(pdePtr, val);
+}
+
+/*
+ * Updates a level3 mapping
+ */
+void nk_pmmu_update_l3_mapping(pdpte_t *pdptePtr, page_entry_t val)
+{
+	/*
+	 * Ensure that the PTE pointer points to an L1 page table.
+	 * If it does not, then report an error.
+	 */
+	page_desc_t *ptDesc = getPageDescPtr(getPhysicalAddr(pdptePtr));
+
+	if (ptDesc->type != PG_L3)
+		panic("SVA: MMU: update_l3 not an L3: %lx %lx: %lx\n",
+		      pdptePtr, val, ptDesc->type);
+
+	// printf("[NK] update_l3: pdpteptr=%p\n", pdptePtr);
+	_update_mapping(pdptePtr, val);
+}
+
+/*
+ * Updates a level4 mapping
+ */
+void nk_pmmu_update_l4_mapping(pml4e_t *pml4ePtr, page_entry_t val)
+{
+	/*
+	 * Ensure that the PTE pointer points to an L1 page table.
+	 * If it does not, then report an error.
+	 */
+	page_desc_t *ptDesc = getPageDescPtr(getPhysicalAddr(pml4ePtr));
+	if (ptDesc->type != PG_L4)
+		panic("NK: MMU: update_l4 not an L4: %lx %lx: %lx\n",
+		      pml4ePtr, val, ptDesc->type);
+
+	// printf("[NK] update_l4: pml4ePtr=%p\n", pml4ePtr);
+	_update_mapping(pml4ePtr, val);
+}
+
+/*
+ * Function: nk_pmmu_remove_mapping()
+ *
+ * Description:
+ *  This function updates the entry to the page table page and is agnostic to
+ *  the level of page table. The particular needs for each page table level are
+ *  handled in the _update_mapping function. The primary function here is to
+ *  set the mapping to zero, if the page was a PTP then zero it's data and set
+ *  it to writeable.
+ *
+ * Inputs:
+ *  pteptr - The location within the page table page for which the translation
+ *           should be removed.
+ */
+void nk_pmmu_remove_mapping(page_entry_t *pteptr)
+{
+	page_desc_t *pgDesc = getPageDescPtr(*pteptr);
+
+	/* Update the page table mapping to zero */
+	_update_mapping (pteptr, ZERO_MAPPING);
 }

@@ -1446,7 +1446,12 @@ getmemsize(caddr_t kmdp, u_int64_t first)
 			/*
 			 * map page into kernel: valid, read/write,non-cacheable
 			 */
+#if 0//#ifdef NESTEDKERNEL
+			/* SVA-TODO: enable this after initialization is figured out */
+			nk_vmmu_update_l1_mapping(pte, pa | PG_V | PG_RW | PG_N);
+#else
 			*pte = pa | PG_V | PG_RW | PG_N;
+#endif
 			invltlb();
 
 			tmp = *(int *)ptr;
@@ -1528,7 +1533,12 @@ do_next:
 				break;
 		}
 	}
+#if 0//#ifdef NESTEDKERNEL
+	/* SVA-TODO: enable this after initialization is figured out */
+	nk_vmmu_update_l1_mapping(pte, 0);
+#else
 	*pte = 0;
+#endif
 	invltlb();
 
 	/*
