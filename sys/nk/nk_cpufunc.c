@@ -57,7 +57,9 @@
 
 #define	CPUID_STDEXT_SMEP	0x00000080
 
+#if 0
 extern u_int cpu_stdext_feature;
+#endif
 
 /*
  * Function: nk_load_cr0
@@ -84,6 +86,7 @@ void nk_load_cr0(register_t val)
  */
 void nk_load_cr4(register_t val)
 {
+#if 0
 	/*
 	 * XXX Test for SMEP support, if not the Nested Kernel Cannot guarantee
 	 * full protections.
@@ -102,6 +105,8 @@ void nk_load_cr4(register_t val)
 	if ((cpu_stdext_feature & CPUID_STDEXT_SMEP) && !(val & CR4_SMEP))
 		panic("Nested Kernel: attempt to clear the CR4.SMEP bit: %p.",
 		      (void *) val);
+#endif
+	_load_cr4(val);
 }
 
 /*
