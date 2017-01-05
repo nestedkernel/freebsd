@@ -80,7 +80,7 @@ ENTRY(cpu_throw)
 	movq	PCB_CR3(%r8),%rdx
 #ifdef NESTEDKERNEL
 	pushq	%rdi
-	mov	%rdx, %rdi
+	movq	%rdx, %rdi
 	callq	nk_load_pgtbl_base_ptr
 	popq	%rdi
 #else
@@ -145,7 +145,7 @@ swinact:
 	pushq	%rdi
 	pushq	%rsi
 	pushq	%rdx
-	mov	%rcx, %rdi
+	movq	%rcx, %rdi
 	callq	nk_load_pgtbl_base_ptr
 	popq	%rdx
 	popq	%rsi
@@ -374,7 +374,14 @@ ENTRY(savectx)
 
 	clts
 	fxsave	PCB_USERFPU(%rdi)
+#ifdef NESTEDKERNEL
+	pushq	%rdi
+	movq	%rsi, %rdi
+	callq	nk_load_cr0
+	popq	%rdi
+#else
 	movq	%rsi,%cr0	/* The previous %cr0 is saved in %rsi. */
+#endif
 
 	movl	$1,%eax
 	ret

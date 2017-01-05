@@ -1986,16 +1986,35 @@ pmap_allocpte(pmap_t pmap, vm_offset_t va, int flags)
 	/*
 	 * Calculate pagetable page index
 	 */
+	// NDD: va shifted to the right 21 bits, gets the top half of va including
+	// the pml4, pdp, and pd.  I don't get why it says ptepindex here... this
+	// is a pde page index... but it also has other stuff...
 	ptepindex = pmap_pde_pindex(va);
 retry:
 	/*
 	 * Get the page directory entry
 	 */
+	// NDD: the pde references a page table --- pd is actually a pde****
 	pd = pmap_pde(pmap, va);
 
 	/*
 	 * This supports switching from a 2MB page to a
 	 * normal 4K page.
+	 */
+	/***** NDD_ NOTE
+	 * So if the pde has both the 2MB and valid bits set then we demote the
+	 * pde. The demote action does a lot of potential creation of new l2 and l1
+	 * mappings as well as modifications to the entries on those pages. I did
+	 * not go through it in detail, but to be able to capture these
+	 * modifications in SVA we will need to go through in depth and instrument. 
+	 * Note though that this only happens if we the PDE is configured with a 
+	 * 2MB page size. Oh so if we are dealing with a 2MB page size for this
+	 * particular entry in the pdp and in the case of this function we are
+	 * attempting to allocate a PTE, which only exists if we have 4kb page
+	 * size. So we need to demote the particular PDE to work with a 4kb page
+	 * size, which means we need to modify the configuration of this pde as
+	 * well as generate new pd-page and the subsequent mappings of adding a new
+	 * level. 
 	 */
 	if (pd != NULL && (*pd & (PG_PS | PG_V)) == (PG_PS | PG_V)) {
 		if (!pmap_demote_pde(pmap, pd, va)) {
@@ -2014,6 +2033,7 @@ retry:
 	if (pd != NULL && (*pd & PG_V) != 0) {
 		m = PHYS_TO_VM_PAGE(*pd & PG_FRAME);
 		m->wire_count++;
+	/* NK-TODO: NDD -- update mapping count for this page */
 	} else {
 		/*
 		 * Here if the pte page isn't mapped, or if it has been
@@ -2031,6 +2051,7 @@ retry:
  * Pmap allocation/deallocation routines.
  ***************************************************/
 
+/* NK-TODO: assess this function for page deallocation */
 /*
  * Release any resources held by the given physical map.
  * Called when a pmap initialized by pmap_pinit is being released.
@@ -3672,6 +3693,8 @@ pmap_enter_pde(pmap_t pmap, vm_offset_t va, vm_page_t m, vm_prot_t prot)
 	 * Map the superpage.
 	 */
 #ifdef NESTEDKERNEL
+	/* NK update the mapping to the newly created pde */
+	/* TODO this is a 2MB pde, we need to handle this in the update function */
 	nk_vmmu_update_l2_mapping(pde, newpde);
 #else
 	pde_store(pde, newpde);

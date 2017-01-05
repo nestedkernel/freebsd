@@ -97,8 +97,47 @@ dtrace_invop_calltrap_addr:
 MCOUNT_LABEL(user)
 MCOUNT_LABEL(btrap)
 
+
+// For better or for worse, 'NESTEDKERNEL'
+// kernel option is used to determine
+// if we're running as NK or normal FreeBSD.
+#ifdef NESTEDKERNEL
+#define DISABLE_INTERRUPTS \
+  /* ENSURE that interrupts are disabled */ \
+  cli;
+
+#define ENABLE_WP_BIT \
+  /* Save scratch register to stack */ \
+  pushq %rax; \
+  /* Get current cr0 value */ \
+  movq %cr0, %rax; \
+  /* Start by seeing if WP is already set */ \
+  jmp 2f; \
+1: \
+  /* Set WP bit in copy */ \
+  orq $0x10000, %rax; \
+  /* Replace cr0 with updated value */ \
+  movq %rax, %cr0; \
+2: \
+  test $0x10000, %eax; \
+  je 1b; \
+  /* Restore clobbered register */ \
+  popq %rax;
+
+#define SECURE_TRAP_ENTRY \
+  /* And that WP is enabled! */ \
+  DISABLE_INTERRUPTS \
+  ENABLE_WP_BIT
+
+#else // !NESTEDKERNEL
+
+#define SECURE_TRAP_ENTRY /* Nothing */
+
+#endif // NESTEDKERNEL
+
 /* Traps that we leave interrupts disabled for.. */
 #define	TRAP_NOEN(a)	\
+	SECURE_TRAP_ENTRY \
 	subq $TF_RIP,%rsp; \
 	movl $(a),TF_TRAPNO(%rsp) ; \
 	movq $0,TF_ADDR(%rsp) ; \
@@ -115,6 +154,7 @@ IDTVEC(dtrace_ret)
 
 /* Regular traps; The cpu does not supply tf_err for these. */
 #define	TRAP(a)	 \
+	SECURE_TRAP_ENTRY \
 	subq $TF_RIP,%rsp; \
 	movl $(a),TF_TRAPNO(%rsp) ; \
 	movq $0,TF_ADDR(%rsp) ; \
@@ -143,6 +183,7 @@ IDTVEC(xmm)
 
 /* This group of traps have tf_err already pushed by the cpu */
 #define	TRAP_ERR(a)	\
+	SECURE_TRAP_ENTRY \
 	subq $TF_ERR,%rsp; \
 	movl $(a),TF_TRAPNO(%rsp) ; \
 	movq $0,TF_ADDR(%rsp) ; \
@@ -251,6 +292,7 @@ alltraps_noen:
 	jmp	alltraps_pushregs_no_rdi
 
 IDTVEC(dblfault)
+	SECURE_TRAP_ENTRY
 	subq	$TF_ERR,%rsp
 	movl	$T_DOUBLEFLT,TF_TRAPNO(%rsp)
 	movq	$0,TF_ADDR(%rsp)
@@ -287,6 +329,7 @@ IDTVEC(dblfault)
 	jmp	2b
 
 IDTVEC(page)
+	SECURE_TRAP_ENTRY
 	subq	$TF_ERR,%rsp
 	movl	$T_PAGEFLT,TF_TRAPNO(%rsp)
 	movq	%rdi,TF_RDI(%rsp)	/* free up a GP register */
@@ -313,6 +356,7 @@ IDTVEC(page)
 	 * XXX linux has a trap handler for their equivalent of load_gs().
 	 */
 IDTVEC(prot)
+	SECURE_TRAP_ENTRY
 	subq	$TF_ERR,%rsp
 	movl	$T_PROTFLT,TF_TRAPNO(%rsp)
 	movq	$0,TF_ADDR(%rsp)
@@ -344,6 +388,7 @@ IDTVEC(prot)
  * entries from an LDT).
  */
 IDTVEC(fast_syscall)
+	SECURE_TRAP_ENTRY
 	swapgs
 	movq	%rsp,PCPU(SCRATCH_RSP)
 	movq	PCPU(RSP0),%rsp
@@ -449,6 +494,7 @@ IDTVEC(fast_syscall32)
  */
 
 IDTVEC(nmi)
+	SECURE_TRAP_ENTRY
 	subq	$TF_RIP,%rsp
 	movl	$(T_NMI),TF_TRAPNO(%rsp)
 	movq	$0,TF_ADDR(%rsp)
